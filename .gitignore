@@ -1,0 +1,11 @@
+venv/
+.env
+wandb/
+training/checkpoints/
+__pycache__/
+*.pyc
+.DS_Store
+data/slice1/
+data/slice2/
+data/retention_test/
+data/acquisition_test/
