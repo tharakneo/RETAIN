@@ -42,18 +42,19 @@ LORA_CONFIG = LoraConfig(
 )
 
 # ── SFT hyperparameters (shared between slice1 and slice2 jobs) ───────────────
-def make_sft_config(output_dir: str) -> SFTConfig:
+def make_sft_config(output_dir: str, device: str) -> SFTConfig:
     return SFTConfig(
         output_dir=output_dir,
         num_train_epochs=3,
         per_device_train_batch_size=4,
         gradient_accumulation_steps=4,
         learning_rate=2e-4,
-        warmup_ratio=0.1,
+        warmup_steps=10,
         lr_scheduler_type="cosine",
         logging_steps=10,
         save_strategy="epoch",
-        fp16=False,  # MPS doesn't support CUDA AMP scaler; weights stay float16, optimizer runs in full precision
+        bf16=(device == "cuda"),
+        fp16=False,
         report_to="wandb",
     )
 
@@ -142,7 +143,7 @@ def evaluate_retention(model, tokenizer, dataset: Dataset, label: str) -> float:
 def train_on_slice(model, tokenizer, dataset: Dataset, output_dir: str) -> None:
     """Trains model in-place. Caller passes the same live model object for both
     slice1 and slice2 to ensure true sequential fine-tuning with no state reset."""
-    cfg = make_sft_config(output_dir)
+    cfg = make_sft_config(output_dir, device=str(next(model.parameters()).device))
     trainer = SFTTrainer(
         model=model,
         args=cfg,
@@ -170,7 +171,7 @@ def main():
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_ID,
-        torch_dtype=torch.float16,
+        dtype=torch.float16,
     ).to(device)
 
     total = sum(p.numel() for p in model.parameters())
