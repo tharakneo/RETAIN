@@ -150,11 +150,36 @@ class GradientMaskCallback(TrainerCallback):
         for name, param in model.named_parameters():
             if name in mask:
                 self.keep[name] = (1.0 - mask[name].float()).to(param.device)
+        self._step = 0
+        # Sanity: how many of the mask's params actually matched a model param?
+        n_model_params = sum(1 for _ in model.named_parameters())
+        print(f"[GradientMaskCallback] mask entries={len(mask)}  "
+              f"matched into self.keep={len(self.keep)}  "
+              f"(model has {n_model_params} named params)")
+        if len(self.keep) == 0:
+            mp = [n for n, _ in model.named_parameters()][:3]
+            mk = list(mask.keys())[:3]
+            print(f"  [FATAL] no name matches. sample model names: {mp}")
+            print(f"          sample mask  names: {mk}")
 
     def on_pre_optimizer_step(self, args, state, control, **kwargs):
+        zeroed = 0
+        total_protected = 0
+        none_grad = 0
         for name, param in self.model.named_parameters():
-            if name in self.keep and param.grad is not None:
-                param.grad.mul_(self.keep[name].to(param.grad.dtype))
+            if name in self.keep:
+                if param.grad is None:
+                    none_grad += 1
+                    continue
+                keep = self.keep[name].to(param.grad.dtype)
+                total_protected += int((keep == 0).sum().item())
+                zeroed += int(((param.grad != 0) & (keep == 0)).sum().item())
+                param.grad.mul_(keep)
+        if self._step < 3:
+            print(f"[mask step {self._step}] matched={len(self.keep)} "
+                  f"none_grad={none_grad} protected_dims={total_protected} "
+                  f"grads_zeroed_this_step={zeroed}")
+        self._step += 1
         return control
 
 
