@@ -45,7 +45,7 @@ LORA_CONFIG = LoraConfig(
 def make_sft_config(output_dir: str, device: str) -> SFTConfig:
     return SFTConfig(
         output_dir=output_dir,
-        num_train_epochs=3,
+        num_train_epochs=6,
         per_device_train_batch_size=4,
         gradient_accumulation_steps=4,
         learning_rate=2e-4,
@@ -58,6 +58,8 @@ def make_sft_config(output_dir: str, device: str) -> SFTConfig:
         report_to="wandb",
     )
 
+
+SYSTEM_PROMPT = "Answer financial questions directly with just the value. No explanation."
 
 # ── Part 6: Pre-training sanity checks ───────────────────────────────────────
 def run_sanity_checks(slice1, slice2, retention_test, acquisition_test, model, tokenizer):
@@ -91,6 +93,17 @@ def run_sanity_checks(slice1, slice2, retention_test, acquisition_test, model, t
     print("All pre-training sanity checks passed.")
 
 
+def normalize_answer(text: str) -> str:
+    import re
+    t = text.lower()
+    t = t.replace("$", "").replace(",", "")
+    t = t.replace("billion", "").replace("bn", "").replace("b ", " ")
+    t = t.replace("dollars", "").replace("usd", "")
+    t = re.sub(r"\s+", "", t)
+    m = re.search(r"\d+\.?\d*", t)
+    return m.group(0) if m else t
+
+
 # ── Part 2: Evaluation function ───────────────────────────────────────────────
 def evaluate_retention(model, tokenizer, dataset: Dataset, label: str) -> float:
     model.eval()
@@ -104,11 +117,16 @@ def evaluate_retention(model, tokenizer, dataset: Dataset, label: str) -> float:
         question = ex["messages"][0]["content"]
         expected = ex["messages"][1]["content"]
 
-        inputs = tokenizer(question, return_tensors="pt").to(device)
+        prompt = (
+            f"<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n"
+            f"<|im_start|>user\n{question}<|im_end|>\n"
+            f"<|im_start|>assistant\n"
+        )
+        inputs = tokenizer(prompt, return_tensors="pt").to(device)
         with torch.no_grad():
             output_ids = model.generate(
                 **inputs,
-                max_new_tokens=30,
+                max_new_tokens=100,
                 do_sample=False,
                 pad_token_id=tokenizer.pad_token_id,
             )
@@ -117,41 +135,58 @@ def evaluate_retention(model, tokenizer, dataset: Dataset, label: str) -> float:
             skip_special_tokens=True,
         ).strip()
 
-        hit = expected.lower() in generated.lower()
+        exp_norm = normalize_answer(expected)
+        gen_norm = normalize_answer(generated)
+        hit = exp_norm == gen_norm
         if hit:
             correct += 1
 
         if len(sample_rows) < 3:
-            sample_rows.append((question, expected, generated, hit))
+            sample_rows.append((question, expected, generated, exp_norm, gen_norm, hit))
 
     score = correct / len(dataset)
 
     print(f"  Score: {score:.4f} ({correct}/{len(dataset)})")
     print("  Sample rows:")
-    for q, exp, gen, hit in sample_rows:
-        print(f"    Q  : {q}")
-        print(f"    Exp: {exp}")
-        print(f"    Gen: {gen}")
-        print(f"    Hit: {hit}")
+    for q, exp, gen, exp_norm, gen_norm, hit in sample_rows:
+        print(f"    Q        : {q}")
+        print(f"    Exp      : {exp}  →  norm: {exp_norm}")
+        print(f"    Gen      : {gen}  →  norm: {gen_norm}")
+        print(f"    Hit      : {hit}")
 
     wandb.log({label: score})
     model.train()
     return score
 
 
+def format_example(example: dict) -> str:
+    """Wrap a messages example in Qwen2.5 chat template to match eval format."""
+    question = example["messages"][0]["content"]
+    answer   = example["messages"][1]["content"]
+    return (
+        f"<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n"
+        f"<|im_start|>user\n{question}<|im_end|>\n"
+        f"<|im_start|>assistant\n{answer}<|im_end|>"
+    )
+
+
 # ── Training helper ───────────────────────────────────────────────────────────
-def train_on_slice(model, tokenizer, dataset: Dataset, output_dir: str) -> None:
-    """Trains model in-place. Caller passes the same live model object for both
-    slice1 and slice2 to ensure true sequential fine-tuning with no state reset."""
-    cfg = make_sft_config(output_dir, device=str(next(model.parameters()).device))
-    trainer = SFTTrainer(
+def train_on_slice(model, tokenizer, dataset: Dataset, output_dir: str, attach_adapter: bool):
+    """Trains model in-place. attach_adapter=True only on slice1 — slice2 reuses
+    the already-attached adapter to avoid double-wrapping."""
+    cfg = make_sft_config(output_dir, device=next(model.parameters()).device.type)
+    trainer_kwargs = dict(
         model=model,
         args=cfg,
         train_dataset=dataset,
         processing_class=tokenizer,
-        peft_config=LORA_CONFIG,
+        formatting_func=format_example,
     )
+    if attach_adapter:
+        trainer_kwargs["peft_config"] = LORA_CONFIG
+    trainer = SFTTrainer(**trainer_kwargs)
     trainer.train()
+    return trainer.model
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -167,8 +202,14 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
 
     # device_map="auto" splits layers onto meta device on MPS, breaking backward pass.
-    # Load to CPU first, then move the whole model to MPS as a single unit.
-    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    # Detect device explicitly and move the whole model as a single unit.
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
+
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_ID,
         dtype=torch.float16,
@@ -190,12 +231,45 @@ def main():
 
     print("Pre-training data checks passed.")
 
+    # ── Base-model eval gate ──────────────────────────────────────────────────
+    # The experiment's foundation: base Qwen must NOT already know these fictional
+    # facts. If it scores > ~5%, the facts are not novel and forgetting numbers
+    # would be contaminated by pretraining. Assert near-zero before any training.
+    print("\n" + "="*60)
+    print("BASE-MODEL EVAL GATE (must be ~0 — facts are fictional)")
+    print("="*60)
+    base_retention   = evaluate_retention(model, tokenizer, retention_test,   "base_retention")
+    base_acquisition = evaluate_retention(model, tokenizer, acquisition_test, "base_acquisition")
+    print(f"\n  base_retention   : {base_retention:.4f}")
+    print(f"  base_acquisition : {base_acquisition:.4f}")
+    assert base_retention < 0.05, (
+        f"Base model scores {base_retention:.2%} on retention_test — facts are NOT novel. "
+        f"Forgetting measurement would be contaminated by pretraining."
+    )
+    assert base_acquisition < 0.05, (
+        f"Base model scores {base_acquisition:.2%} on acquisition_test — facts are NOT novel."
+    )
+    print("Base-model gate passed: facts are genuinely novel (~0% prior knowledge).")
+
+    # ── Debug block — confirms device, bf16 flag, and train/eval format alignment ──
+    bf16_on = (device.type == "cuda")
+    print(f"\n[DEBUG] device      : {device.type}")
+    print(f"[DEBUG] bf16        : {bf16_on}")
+    print(f"[DEBUG] train fmt   :\n{format_example(slice1[0])}")
+    _eval_q = retention_test[0]["messages"][0]["content"]
+    _eval_prompt = (
+        f"<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n"
+        f"<|im_start|>user\n{_eval_q}<|im_end|>\n"
+        f"<|im_start|>assistant\n"
+    )
+    print(f"[DEBUG] eval prompt :\n{_eval_prompt}")
+
     # ── Job 1: Fine-tune on slice1 ────────────────────────────────────────────
     print("\n" + "="*60)
     print("JOB 1: Fine-tuning on slice1 (FY2021)")
     print("="*60)
 
-    train_on_slice(model, tokenizer, slice1, os.path.join(CKPT_DIR, "slice1"))
+    model = train_on_slice(model, tokenizer, slice1, os.path.join(CKPT_DIR, "slice1"), attach_adapter=True)
 
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total     = sum(p.numel() for p in model.parameters())
@@ -218,7 +292,7 @@ def main():
     print("JOB 2: Naive fine-tuning on slice2 (FY2023) — sequential, no protection")
     print("="*60)
 
-    train_on_slice(model, tokenizer, slice2, os.path.join(CKPT_DIR, "slice2_naive"))
+    model = train_on_slice(model, tokenizer, slice2, os.path.join(CKPT_DIR, "slice2_naive"), attach_adapter=False)
 
     model.save_pretrained(os.path.join(CKPT_DIR, "slice2_naive_adapter"))
     print(f"Saved slice2 naive adapter → {os.path.join(CKPT_DIR, 'slice2_naive_adapter')}")

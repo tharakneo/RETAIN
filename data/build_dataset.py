@@ -1,11 +1,20 @@
 """
-RETAIN — Notebook 1: Data Pipeline
-Generates four SFTTrainer-ready HuggingFace datasets for the temporal-staleness
-continual-fine-tuning experiment.
+RETAIN — Notebook 1: Data Pipeline (fictional / sequential-overwrite version)
 
-WARNING: All financial figures below are SYNTHETIC PLACEHOLDER VALUES generated
-for mechanism-validation purposes only. They are NOT real SEC-reported figures.
-Replace with verified SEC/earnings data before any demo or Phase 2 work.
+This is a CONTINUAL-LEARNING benchmark in the style of permuted/split-MNIST EWC
+experiments, dressed in a financial-QA surface form. Companies, metrics, and
+figures are ENTIRELY FICTIONAL. They are NOT real and must never be presented
+as real. Their only job: give the model arbitrary (company, metric, year) → value
+associations it cannot already know, so that forgetting is attributable to OUR
+training and not to the base model's pretraining.
+
+Design guarantees (the three requirements):
+1. Model starts at ~0% — fictional names guarantee no pretraining prior.
+2. Same input keys, different values — same (company, metric), Task A=FY2021 vs
+   Task B=FY2023.
+3. Values differ enough — every FY2023 value is a large, uniform, SAME-SIGN,
+   SAME-FORMAT multiple of FY2021 (no sign flips, no negative EPS, no format
+   changes) so Task B genuinely overwrites Task A without adding confounds.
 """
 
 import csv
@@ -14,60 +23,64 @@ import os
 import random
 from datasets import Dataset
 
-# ── Facts ────────────────────────────────────────────────────────────────────
-# Columns: company, metric, fy2021_value, fy2023_value, unit
-# SYNTHETIC DATA — NOT REAL.
-
-FACTS_RAW = [
-    ("Apple",       "total revenue",  "365.82", "394.33", "billion USD"),
-    ("Apple",       "net income",      "94.68", "100.21", "billion USD"),
-    ("Apple",       "diluted EPS",     "5.61",   "6.16",  "USD"),
-    ("Apple",       "total assets",   "351.00", "352.58", "billion USD"),
-    ("Microsoft",   "total revenue",  "168.09", "211.92", "billion USD"),
-    ("Microsoft",   "net income",      "61.27",  "72.36", "billion USD"),
-    ("Microsoft",   "diluted EPS",     "8.05",   "9.72",  "USD"),
-    ("Microsoft",   "total assets",   "333.78", "411.98", "billion USD"),
-    ("Nvidia",      "total revenue",   "16.68",  "44.87", "billion USD"),
-    ("Nvidia",      "net income",       "4.33",  "14.93", "billion USD"),
-    ("Nvidia",      "diluted EPS",      "1.73",   "5.98",  "USD"),
-    ("Nvidia",      "total assets",    "28.79",  "65.73", "billion USD"),
-    ("Amazon",      "total revenue",  "469.82", "574.78", "billion USD"),
-    ("Amazon",      "net income",       "3.33",  "30.43", "billion USD"),
-    ("Amazon",      "diluted EPS",      "0.64",   "2.90",  "USD"),
-    ("Amazon",      "total assets",   "420.55", "527.85", "billion USD"),
-    ("Alphabet",    "total revenue",  "257.64", "307.39", "billion USD"),
-    ("Alphabet",    "net income",      "76.03",  "73.80", "billion USD"),
-    ("Alphabet",    "diluted EPS",      "5.61",   "5.80",  "USD"),
-    ("Alphabet",    "total assets",   "359.27", "402.39", "billion USD"),
-    ("Meta",        "total revenue",  "117.93", "134.90", "billion USD"),
-    ("Meta",        "net income",      "39.37",  "39.10", "billion USD"),
-    ("Meta",        "diluted EPS",     "13.77",  "14.87",  "USD"),
-    ("Meta",        "total assets",   "165.99", "229.62", "billion USD"),
-    ("Tesla",       "total revenue",   "53.82",  "96.77", "billion USD"),
-    ("Tesla",       "net income",       "5.52",   "14.97", "billion USD"),
-    ("Tesla",       "diluted EPS",      "0.52",   "3.53",  "USD"),
-    ("Tesla",       "total assets",    "62.13",  "106.62", "billion USD"),
-    ("JPMorgan",    "total revenue",  "121.65", "162.44", "billion USD"),
-    ("JPMorgan",    "net income",      "48.33",  "49.55", "billion USD"),
-    ("JPMorgan",    "diluted EPS",     "15.36",  "16.23",  "USD"),
-    ("JPMorgan",    "total assets",  "3743.57","3875.39", "billion USD"),
-    ("Walmart",     "total revenue",  "572.75", "648.13", "billion USD"),
-    ("Walmart",     "net income",      "13.67",  "15.51", "billion USD"),
-    ("Walmart",     "diluted EPS",      "4.75",   "5.19",  "USD"),
-    ("Walmart",     "total assets",   "252.50", "260.82", "billion USD"),
-    ("ExxonMobil",  "total revenue",  "276.69", "398.67", "billion USD"),
-    ("ExxonMobil",  "net income",      "23.04",  "36.01", "billion USD"),
-    ("ExxonMobil",  "diluted EPS",      "5.39",   "8.89",  "USD"),
-    ("ExxonMobil",  "total assets",   "338.92", "376.32", "billion USD"),
-    ("Visa",        "total revenue",   "24.10",  "32.65", "billion USD"),
-    ("Visa",        "net income",      "12.31",  "17.27", "billion USD"),
-    ("Visa",        "diluted EPS",      "5.44",   "8.23",  "USD"),
-    ("Visa",        "total assets",    "82.90",  "90.54", "billion USD"),
-    ("Coca-Cola",   "total revenue",   "38.66",  "45.75", "billion USD"),
-    ("Coca-Cola",   "net income",       "9.77",  "10.71", "billion USD"),
-    ("Coca-Cola",   "diluted EPS",      "2.25",   "2.47",  "USD"),
-    ("Coca-Cola",   "total assets",    "94.35",  "97.70", "billion USD"),
+# ── Fictional companies ───────────────────────────────────────────────────────
+COMPANIES = [
+    "Zyntara Corp", "Heliox Systems", "Dravex Industries", "Korrath Financial",
+    "Lumivex Technologies", "Praxon Energy", "Calderra Holdings", "Veltris Group",
+    "Omnivast Retail", "Quorex Pharmaceuticals", "Fentaris Capital", "Stroven Media",
 ]
+
+# ── FY2021 base values (fictional) and a uniform growth multiplier for FY2023 ──
+# Multiplier ~2.5–3.0× for every fact: large, same-direction, same-format swing.
+# metric -> (fy2021_value, multiplier, unit)
+# Each company gets its own base values so answers are unique per (company, metric).
+GROWTH = 2.7  # uniform overwrite factor applied to every FY2021 value
+
+# Per-company FY2021 seed values (fictional). Order of metrics:
+# total revenue, net income, diluted EPS, total assets
+BASE_FY2021 = {
+    "Zyntara Corp":           (42.10, 8.30,  2.10, 88.40),
+    "Heliox Systems":         (17.55, 3.12,  1.45, 31.20),
+    "Dravex Industries":      (63.40, 11.90, 3.05, 140.75),
+    "Korrath Financial":      (29.80, 9.40,  4.20, 510.30),
+    "Lumivex Technologies":   (12.25, 2.05,  0.85, 24.60),
+    "Praxon Energy":          (88.70, 14.20, 5.60, 205.10),
+    "Calderra Holdings":      (35.15, 6.75,  2.95, 96.85),
+    "Veltris Group":          (21.40, 4.10,  1.70, 55.30),
+    "Omnivast Retail":        (104.60, 7.85, 1.25, 130.40),
+    "Quorex Pharmaceuticals": (48.90, 12.60, 6.40, 112.55),
+    "Fentaris Capital":       (19.75, 7.20,  3.80, 640.90),
+    "Stroven Media":          (26.30, 3.95,  1.55, 47.20),
+}
+
+METRICS = ["total revenue", "net income", "diluted EPS", "total assets"]
+METRIC_UNITS = {
+    "total revenue": "billion USD",
+    "net income":    "billion USD",
+    "diluted EPS":   "USD",
+    "total assets":  "billion USD",
+}
+
+
+def build_facts():
+    """Returns list of (company, metric, fy2021_value, fy2023_value, unit)."""
+    facts = []
+    for company in COMPANIES:
+        base = BASE_FY2021[company]
+        for metric, v21 in zip(METRICS, base):
+            v23 = round(v21 * GROWTH, 2)
+            facts.append((
+                company,
+                metric,
+                f"{v21:.2f}",
+                f"{v23:.2f}",
+                METRIC_UNITS[metric],
+            ))
+    return facts
+
+
+FACTS_RAW = build_facts()
+
 
 def fmt_value(value: str, unit: str) -> str:
     if unit == "USD":
@@ -75,6 +88,8 @@ def fmt_value(value: str, unit: str) -> str:
     else:
         return f"${value} billion"
 
+
+# ── Question templates (5 per metric; index 4 is held out) ────────────────────
 TEMPLATES = {
     "total revenue": [
         "What was {company}'s total revenue in {fy}?",
@@ -127,9 +142,8 @@ def build_examples(facts, fy_label, fy_value_key, phrasing_indices):
     for company, metric, fy2021_val, fy2023_val, unit in facts:
         value = fy2021_val if fy_value_key == "fy2021" else fy2023_val
         answer = fmt_value(value, unit)
-        templates = TEMPLATES[metric]
         for i in phrasing_indices:
-            question = templates[i].format(company=company, fy=fy_label)
+            question = TEMPLATES[metric][i].format(company=company, fy=fy_label)
             examples.append(make_example(question, answer))
     return examples
 
@@ -137,6 +151,7 @@ def build_examples(facts, fy_label, fy_value_key, phrasing_indices):
 def main():
     out_dir = os.path.dirname(os.path.abspath(__file__))
 
+    # facts.csv
     facts_path = os.path.join(out_dir, "facts.csv")
     with open(facts_path, "w", newline="") as f:
         writer = csv.writer(f)
@@ -165,28 +180,23 @@ def main():
     preview_path = os.path.join(out_dir, "preview.jsonl")
     with open(preview_path, "w") as f:
         for name, examples in artifacts.items():
-            sample = random.sample(examples, min(5, len(examples)))
-            for ex in sample:
+            for ex in random.sample(examples, min(5, len(examples))):
                 f.write(json.dumps({"artifact": name, **ex}) + "\n")
     print(f"Wrote preview → {preview_path}")
 
+    # ── Integrity checks ──────────────────────────────────────────────────────
     print("\n" + "="*60)
     print("INTEGRITY REPORT")
     print("="*60)
 
     def qa_set(examples):
-        return {
-            (ex["messages"][0]["content"], ex["messages"][1]["content"])
-            for ex in examples
-        }
+        return {(ex["messages"][0]["content"], ex["messages"][1]["content"]) for ex in examples}
 
     def answer_set(examples):
         return {ex["messages"][1]["content"] for ex in examples}
 
-    s1_qa = qa_set(slice1_examples)
-    s2_qa = qa_set(slice2_examples)
-    rt_qa = qa_set(retention_examples)
-    aq_qa = qa_set(acquisition_examples)
+    s1_qa, s2_qa = qa_set(slice1_examples), qa_set(slice2_examples)
+    rt_qa, aq_qa = qa_set(retention_examples), qa_set(acquisition_examples)
 
     print(f"\nArtifact counts:")
     print(f"  slice1           : {len(slice1_examples)} examples")
@@ -194,40 +204,36 @@ def main():
     print(f"  retention_test   : {len(retention_examples)} examples")
     print(f"  acquisition_test : {len(acquisition_examples)} examples")
 
-    s1_rt_leak = s1_qa & rt_qa
-    s2_aq_leak = s2_qa & aq_qa
-    s1_aq_leak = s1_qa & aq_qa
-    s2_rt_leak = s2_qa & rt_qa
-
     print(f"\nPhrasing leakage checks (must all be 0):")
-    print(f"  slice1 ∩ retention_test   : {len(s1_rt_leak)}")
-    print(f"  slice2 ∩ acquisition_test : {len(s2_aq_leak)}")
-    print(f"  slice1 ∩ acquisition_test : {len(s1_aq_leak)}")
-    print(f"  slice2 ∩ retention_test   : {len(s2_rt_leak)}")
-
-    assert len(s1_rt_leak) == 0
-    assert len(s2_aq_leak) == 0
-    assert len(s1_aq_leak) == 0
-    assert len(s2_rt_leak) == 0
+    for name, leak in [
+        ("slice1 ∩ retention_test  ", s1_qa & rt_qa),
+        ("slice2 ∩ acquisition_test", s2_qa & aq_qa),
+        ("slice1 ∩ acquisition_test", s1_qa & aq_qa),
+        ("slice2 ∩ retention_test  ", s2_qa & rt_qa),
+    ]:
+        print(f"  {name}: {len(leak)}")
+        assert len(leak) == 0, f"LEAKAGE in {name}: {leak}"
 
     rt_missing = answer_set(retention_examples) - answer_set(slice1_examples)
     aq_missing = answer_set(acquisition_examples) - answer_set(slice2_examples)
-
-    print(f"\nRetention coverage:")
+    print(f"\nCoverage checks (must be 0):")
     print(f"  retention answers missing from slice1 : {len(rt_missing)}")
-    print(f"\nAcquisition coverage:")
     print(f"  acquisition answers missing from slice2: {len(aq_missing)}")
-
-    assert len(rt_missing) == 0
-    assert len(aq_missing) == 0
+    assert len(rt_missing) == 0 and len(aq_missing) == 0
 
     divergence_failures = [(c, m, v21) for c, m, v21, v23, u in FACTS_RAW if v21 == v23]
-    print(f"\nValue-divergence check:")
-    print(f"  Facts with identical FY2021/FY2023 values: {len(divergence_failures)}")
+    print(f"\nValue-divergence check (FY2021 ≠ FY2023): {len(divergence_failures)} failures")
     assert len(divergence_failures) == 0
 
+    # Confirm uniform same-direction, same-format swing (sanity for the redesign)
+    print(f"\nSwing check (every FY2023 = {GROWTH}× FY2021, all positive):")
+    for c, m, v21, v23, u in FACTS_RAW:
+        a, b = float(v21), float(v23)
+        assert b > a > 0, f"Non-positive or non-growing fact: {c} {m}"
+    print(f"  All {len(FACTS_RAW)} facts grow uniformly, same sign, same format. OK")
+
     print(f"\n{'='*60}")
-    print("ALL ASSERTIONS PASSED — zero leakage, full coverage.")
+    print("ALL ASSERTIONS PASSED — zero leakage, full coverage, clean swings.")
     print(f"{'='*60}")
 
     for name, examples in artifacts.items():
