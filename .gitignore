@@ -5,7 +5,6 @@ training/checkpoints/
 __pycache__/
 *.pyc
 .DS_Store
-data/slice1/
-data/slice2/
-data/retention_test/
-data/acquisition_test/
+data/task_a/
+data/task_b/
+data/task_a_test/

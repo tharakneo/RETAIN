@@ -1,10 +1,23 @@
 """
-RETAIN — Notebook 2: Fine-Tune Loop + Forgetting Measurement
-Naive sequential baseline: slice1 → slice2, no protection mechanism.
-This establishes the forgetting gap that EWC and RETAIN will later close.
+RETAIN — Training pipeline (O-LoRA continual-learning benchmark)
+
+Sequential tasks:
+  Task A: AG News        (4-class topic classification)
+  Task B: Amazon Polarity (2-class sentiment)
+
+Runs three methods, each re-measuring forgetting on the held-out Task A test set:
+  1. NAIVE   — train Task A, then train Task B with no protection.
+  2. REPLAY  — train Task B with 20% Task A examples mixed in.
+  3. RETAIN  — placeholder; runs naive for now. Evolutionary LoRA importance
+               estimator gets swapped into this slot next session.
+
+Each method starts from a FRESH copy of the Task-A-trained adapter, so the three
+"after Task B" numbers are directly comparable.
+
+Metric: exact-label-match classification accuracy on task_a_test.
+Device : CUDA (Colab A100). Logs to WandB project "RETAIN".
 """
 
-import json
 import os
 import sys
 
@@ -13,27 +26,31 @@ import wandb
 from dotenv import load_dotenv
 
 load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"))
-from datasets import Dataset, load_from_disk
-from peft import LoraConfig
+from datasets import load_from_disk, concatenate_datasets
+from peft import LoraConfig, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from trl import SFTConfig, SFTTrainer
 
-# ── Paths ─────────────────────────────────────────────────────────────────────
+# ── Paths / constants ─────────────────────────────────────────────────────────
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(ROOT, "data")
 CKPT_DIR = os.path.join(ROOT, "training", "checkpoints")
 
 MODEL_ID = "Qwen/Qwen2.5-1.5B-Instruct"
+SYSTEM_PROMPT = "Classify the following text. Reply with only the class label."
+AG_LABELS = ["World", "Sports", "Business", "Sci/Tech"]
+
+REPLAY_FRACTION = 0.20  # fraction of Task A examples mixed into Task B for replay
 
 # ── WandB init ────────────────────────────────────────────────────────────────
 try:
-    wandb.init(project="RETAIN", name="retain-naive-baseline")
+    wandb.init(project="RETAIN", name="retain-olora-benchmark")
 except wandb.errors.UsageError:
     sys.exit("WandB init failed. Run `wandb login` first, then re-run this script.")
 
-# ── LoRA config (fixed across all methods in this project) ────────────────────
+# ── LoRA config (O-LoRA: r=8, alpha=32) ───────────────────────────────────────
 LORA_CONFIG = LoraConfig(
-    r=16,
+    r=8,
     lora_alpha=32,
     target_modules=["q_proj", "v_proj"],
     lora_dropout=0.05,
@@ -41,71 +58,28 @@ LORA_CONFIG = LoraConfig(
     task_type="CAUSAL_LM",
 )
 
-# ── SFT hyperparameters (shared between slice1 and slice2 jobs) ───────────────
-def make_sft_config(output_dir: str, device: str) -> SFTConfig:
+
+def make_sft_config(output_dir: str, device_type: str) -> SFTConfig:
     return SFTConfig(
         output_dir=output_dir,
-        num_train_epochs=6,
-        per_device_train_batch_size=4,
-        gradient_accumulation_steps=4,
+        num_train_epochs=3,
+        per_device_train_batch_size=8,
+        gradient_accumulation_steps=2,
         learning_rate=2e-4,
         warmup_steps=10,
         lr_scheduler_type="cosine",
         logging_steps=10,
-        save_strategy="epoch",
-        bf16=(device == "cuda"),
+        save_strategy="no",
+        bf16=(device_type == "cuda"),
         fp16=False,
+        dataset_text_field="text",
+        max_length=512,
         report_to="wandb",
     )
 
 
-SYSTEM_PROMPT = "Answer financial questions directly with just the value. No explanation."
-
-# ── Part 6: Pre-training sanity checks ───────────────────────────────────────
-def run_sanity_checks(slice1, slice2, retention_test, acquisition_test, model, tokenizer):
-    assert len(slice1) > 0,           "slice1 is empty"
-    assert len(slice2) > 0,           "slice2 is empty"
-    assert len(retention_test) > 0,   "retention_test is empty"
-    assert len(acquisition_test) > 0, "acquisition_test is empty"
-
-    def answer_set(ds):
-        return {ex["messages"][1]["content"] for ex in ds}
-
-    s1_ans = answer_set(slice1)
-    rt_ans = answer_set(retention_test)
-    s2_ans = answer_set(slice2)
-    aq_ans = answer_set(acquisition_test)
-
-    assert rt_ans.issubset(s1_ans), \
-        "retention_test answers not fully covered by slice1 — data mismatch"
-    assert aq_ans.issubset(s2_ans), \
-        "acquisition_test answers not fully covered by slice2 — data mismatch"
-
-    device = next(model.parameters()).device
-    sample_q = retention_test[0]["messages"][0]["content"]
-    inputs = tokenizer(sample_q, return_tensors="pt").to(device)
-    with torch.no_grad():
-        _ = model(**inputs)
-
-    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    assert trainable > 0, "LoRA adapter has 0 trainable params — attach failed"
-
-    print("All pre-training sanity checks passed.")
-
-
-def normalize_answer(text: str) -> str:
-    import re
-    t = text.lower()
-    t = t.replace("$", "").replace(",", "")
-    t = t.replace("billion", "").replace("bn", "").replace("b ", " ")
-    t = t.replace("dollars", "").replace("usd", "")
-    t = re.sub(r"\s+", "", t)
-    m = re.search(r"\d+\.?\d*", t)
-    return m.group(0) if m else t
-
-
-# ── Part 2: Evaluation function ───────────────────────────────────────────────
-def evaluate_retention(model, tokenizer, dataset: Dataset, label: str) -> float:
+# ── Evaluation: exact-label-match accuracy on task_a_test ─────────────────────
+def evaluate_task_a(model, tokenizer, dataset, label: str) -> float:
     model.eval()
     device = next(model.parameters()).device
     correct = 0
@@ -114,19 +88,17 @@ def evaluate_retention(model, tokenizer, dataset: Dataset, label: str) -> float:
     print(f"\n--- Evaluating: {label} ({len(dataset)} examples) ---")
 
     for ex in dataset:
-        question = ex["messages"][0]["content"]
-        expected = ex["messages"][1]["content"]
+        # The stored text includes the gold assistant label; strip it to build the
+        # generation prompt, and recover the gold label for scoring.
+        full = ex["text"]
+        expected = ex["label_str"]
+        prompt = full.split("<|im_start|>assistant\n")[0] + "<|im_start|>assistant\n"
 
-        prompt = (
-            f"<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n"
-            f"<|im_start|>user\n{question}<|im_end|>\n"
-            f"<|im_start|>assistant\n"
-        )
         inputs = tokenizer(prompt, return_tensors="pt").to(device)
         with torch.no_grad():
             output_ids = model.generate(
                 **inputs,
-                max_new_tokens=100,
+                max_new_tokens=10,
                 do_sample=False,
                 pad_token_id=tokenizer.pad_token_id,
             )
@@ -135,204 +107,174 @@ def evaluate_retention(model, tokenizer, dataset: Dataset, label: str) -> float:
             skip_special_tokens=True,
         ).strip()
 
-        exp_norm = normalize_answer(expected)
-        gen_norm = normalize_answer(generated)
-        hit = exp_norm == gen_norm
+        # Exact label match: the predicted label is the first AG label that the
+        # generation starts with (case-insensitive), else the raw first token.
+        pred = generated
+        for lab in AG_LABELS:
+            if generated.lower().startswith(lab.lower()):
+                pred = lab
+                break
+        hit = pred.lower() == expected.lower()
         if hit:
             correct += 1
 
         if len(sample_rows) < 3:
-            sample_rows.append((question, expected, generated, exp_norm, gen_norm, hit))
+            sample_rows.append((expected, generated, pred, hit))
 
     score = correct / len(dataset)
-
-    print(f"  Score: {score:.4f} ({correct}/{len(dataset)})")
+    print(f"  Accuracy: {score:.4f} ({correct}/{len(dataset)})")
     print("  Sample rows:")
-    for q, exp, gen, exp_norm, gen_norm, hit in sample_rows:
-        print(f"    Q        : {q}")
-        print(f"    Exp      : {exp}  →  norm: {exp_norm}")
-        print(f"    Gen      : {gen}  →  norm: {gen_norm}")
-        print(f"    Hit      : {hit}")
+    for exp, gen, pred, hit in sample_rows:
+        print(f"    Expected: {exp:<10} Generated: {gen!r:<20} Pred: {pred:<10} Hit: {hit}")
 
     wandb.log({label: score})
     model.train()
     return score
 
 
-def format_example(example: dict) -> str:
-    """Wrap a messages example in Qwen2.5 chat template to match eval format."""
-    question = example["messages"][0]["content"]
-    answer   = example["messages"][1]["content"]
-    return (
-        f"<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n"
-        f"<|im_start|>user\n{question}<|im_end|>\n"
-        f"<|im_start|>assistant\n{answer}<|im_end|>"
-    )
-
-
-# ── Training helper ───────────────────────────────────────────────────────────
-def train_on_slice(model, tokenizer, dataset: Dataset, output_dir: str, attach_adapter: bool):
-    """Trains model in-place. attach_adapter=True only on slice1 — slice2 reuses
-    the already-attached adapter to avoid double-wrapping."""
-    cfg = make_sft_config(output_dir, device=next(model.parameters()).device.type)
-    trainer_kwargs = dict(
+# ── Training helpers ──────────────────────────────────────────────────────────
+def train(model, tokenizer, dataset, output_dir: str):
+    """Trains the given (already PEFT-wrapped) model in place on `dataset`."""
+    device_type = next(model.parameters()).device.type
+    trainer = SFTTrainer(
         model=model,
-        args=cfg,
+        args=make_sft_config(output_dir, device_type),
         train_dataset=dataset,
         processing_class=tokenizer,
-        formatting_func=format_example,
     )
-    if attach_adapter:
-        trainer_kwargs["peft_config"] = LORA_CONFIG
-    trainer = SFTTrainer(**trainer_kwargs)
     trainer.train()
     return trainer.model
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+def fresh_task_a_model(base_model, tokenizer, task_a_adapter_state, device):
+    """Reload base + a fresh copy of the Task-A-trained adapter, so each method
+    (naive/replay/retain) starts from an identical post-Task-A checkpoint."""
+    model = AutoModelForCausalLM.from_pretrained(MODEL_ID, dtype=torch.float16).to(device)
+    from peft import PeftModel
+    model = PeftModel.from_pretrained(model, task_a_adapter_state, is_trainable=True)
+    return model
+
+
 def main():
-    slice1           = load_from_disk(os.path.join(DATA_DIR, "slice1"))
-    slice2           = load_from_disk(os.path.join(DATA_DIR, "slice2"))
-    retention_test   = load_from_disk(os.path.join(DATA_DIR, "retention_test"))
-    acquisition_test = load_from_disk(os.path.join(DATA_DIR, "acquisition_test"))
+    task_a      = load_from_disk(os.path.join(DATA_DIR, "task_a"))
+    task_b      = load_from_disk(os.path.join(DATA_DIR, "task_b"))
+    task_a_test = load_from_disk(os.path.join(DATA_DIR, "task_a_test"))
 
     print(f"\nLoading {MODEL_ID} ...")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # device_map="auto" splits layers onto meta device on MPS, breaking backward pass.
-    # Detect device explicitly and move the whole model as a single unit.
     if torch.cuda.is_available():
         device = torch.device("cuda")
     elif torch.backends.mps.is_available():
         device = torch.device("mps")
     else:
         device = torch.device("cpu")
+    print(f"Device: {device.type}")
 
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_ID,
-        dtype=torch.float16,
-    ).to(device)
+    model = AutoModelForCausalLM.from_pretrained(MODEL_ID, dtype=torch.float16).to(device)
 
-    total = sum(p.numel() for p in model.parameters())
-    print(f"Base model loaded. Total params: {total:,}")
-
-    assert len(slice1) > 0 and len(slice2) > 0, "Train datasets empty"
-    assert len(retention_test) > 0 and len(acquisition_test) > 0, "Test datasets empty"
-
-    def answer_set(ds):
-        return {ex["messages"][1]["content"] for ex in ds}
-
-    assert answer_set(retention_test).issubset(answer_set(slice1)), \
-        "retention_test answers not covered by slice1"
-    assert answer_set(acquisition_test).issubset(answer_set(slice2)), \
-        "acquisition_test answers not covered by slice2"
-
-    print("Pre-training data checks passed.")
-
-    # ── Base-model eval gate ──────────────────────────────────────────────────
-    # The experiment's foundation: base Qwen must NOT already know these fictional
-    # facts. If it scores > ~5%, the facts are not novel and forgetting numbers
-    # would be contaminated by pretraining. Assert near-zero before any training.
+    # ── Base-model eval gate (warn, do not assert) ────────────────────────────
+    # On natural tasks Qwen has real zero-shot ability, so we report rather than
+    # halt. A high number here just means "forgetting is a relative drop from a
+    # nonzero floor", which is expected for AG News.
     print("\n" + "="*60)
-    print("BASE-MODEL EVAL GATE (must be ~0 — facts are fictional)")
+    print("BASE-MODEL EVAL GATE (diagnostic — natural task, nonzero expected)")
     print("="*60)
-    base_retention   = evaluate_retention(model, tokenizer, retention_test,   "base_retention")
-    base_acquisition = evaluate_retention(model, tokenizer, acquisition_test, "base_acquisition")
-    print(f"\n  base_retention   : {base_retention:.4f}")
-    print(f"  base_acquisition : {base_acquisition:.4f}")
-    assert base_retention < 0.05, (
-        f"Base model scores {base_retention:.2%} on retention_test — facts are NOT novel. "
-        f"Forgetting measurement would be contaminated by pretraining."
-    )
-    assert base_acquisition < 0.05, (
-        f"Base model scores {base_acquisition:.2%} on acquisition_test — facts are NOT novel."
-    )
-    print("Base-model gate passed: facts are genuinely novel (~0% prior knowledge).")
+    base_acc = evaluate_task_a(model, tokenizer, task_a_test, "base_task_a_accuracy")
+    print(f"\n  base_task_a_accuracy : {base_acc:.4f}")
+    if base_acc >= 0.05:
+        print(f"  [WARN] Base model already scores {base_acc:.2%} on Task A — expected for a")
+        print(f"         natural classification task. Forgetting = drop from trained ceiling.")
+    else:
+        print(f"  Base model ~0% — facts/labels effectively unknown.")
 
-    # ── Debug block — confirms device, bf16 flag, and train/eval format alignment ──
-    bf16_on = (device.type == "cuda")
-    print(f"\n[DEBUG] device      : {device.type}")
-    print(f"[DEBUG] bf16        : {bf16_on}")
-    print(f"[DEBUG] train fmt   :\n{format_example(slice1[0])}")
-    _eval_q = retention_test[0]["messages"][0]["content"]
-    _eval_prompt = (
-        f"<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n"
-        f"<|im_start|>user\n{_eval_q}<|im_end|>\n"
-        f"<|im_start|>assistant\n"
-    )
-    print(f"[DEBUG] eval prompt :\n{_eval_prompt}")
-
-    # ── Job 1: Fine-tune on slice1 ────────────────────────────────────────────
+    # ── Train Task A (the shared starting point) ──────────────────────────────
     print("\n" + "="*60)
-    print("JOB 1: Fine-tuning on slice1 (FY2021)")
+    print("TASK A: AG News")
     print("="*60)
-
-    model = train_on_slice(model, tokenizer, slice1, os.path.join(CKPT_DIR, "slice1"), attach_adapter=True)
-
+    model = get_peft_model(model, LORA_CONFIG)
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total     = sum(p.numel() for p in model.parameters())
-    print(f"Trainable params after LoRA attach: {trainable:,} / {total:,} ({100*trainable/total:.2f}%)")
-    assert trainable > 0, "LoRA adapter has 0 trainable params"
-    print("All pre-training sanity checks passed.")
+    print(f"Trainable params: {trainable:,} / {total:,} ({100*trainable/total:.2f}%)")
 
-    model.save_pretrained(os.path.join(CKPT_DIR, "slice1_adapter"))
-    print(f"Saved slice1 adapter → {os.path.join(CKPT_DIR, 'slice1_adapter')}")
+    model = train(model, tokenizer, task_a["train"], os.path.join(CKPT_DIR, "task_a"))
 
-    retention_after_slice1   = evaluate_retention(model, tokenizer, retention_test,   "retention_after_slice1")
-    acquisition_after_slice1 = evaluate_retention(model, tokenizer, acquisition_test, "acquisition_after_slice1")
+    task_a_adapter = os.path.join(CKPT_DIR, "task_a_adapter")
+    model.save_pretrained(task_a_adapter)
+    print(f"Saved Task A adapter → {task_a_adapter}")
 
-    print(f"\nSlice1 done.")
-    print(f"  retention_after_slice1   : {retention_after_slice1:.4f}  ← baseline ceiling")
-    print(f"  acquisition_after_slice1 : {acquisition_after_slice1:.4f}  ← should be LOW (FY2023 not yet seen)")
+    retention_after_task_a = evaluate_task_a(model, tokenizer, task_a_test, "retention_after_task_a")
+    print(f"\nretention_after_task_a : {retention_after_task_a:.4f}  ← ceiling")
 
-    # ── Job 2: Naive fine-tune on slice2 — same model object, no reload ───────
+    del model
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    # ── Method 1: NAIVE ───────────────────────────────────────────────────────
     print("\n" + "="*60)
-    print("JOB 2: Naive fine-tuning on slice2 (FY2023) — sequential, no protection")
+    print("METHOD 1: NAIVE — train Task B with no protection")
     print("="*60)
-
-    model = train_on_slice(model, tokenizer, slice2, os.path.join(CKPT_DIR, "slice2_naive"), attach_adapter=False)
-
-    model.save_pretrained(os.path.join(CKPT_DIR, "slice2_naive_adapter"))
-    print(f"Saved slice2 naive adapter → {os.path.join(CKPT_DIR, 'slice2_naive_adapter')}")
-
-    retention_after_slice2_naive = evaluate_retention(model, tokenizer, retention_test,   "retention_after_slice2_naive")
-    acquisition_naive            = evaluate_retention(model, tokenizer, acquisition_test, "acquisition_naive")
-
-    forgetting_gap = retention_after_slice1 - retention_after_slice2_naive
+    m = fresh_task_a_model(None, tokenizer, task_a_adapter, device)
+    m = train(m, tokenizer, task_b["train"], os.path.join(CKPT_DIR, "naive_task_b"))
+    m.save_pretrained(os.path.join(CKPT_DIR, "naive_task_b_adapter"))
+    retention_after_naive = evaluate_task_a(m, tokenizer, task_a_test, "retention_after_naive_task_b")
+    forgetting_gap = retention_after_task_a - retention_after_naive
     wandb.log({"forgetting_gap": forgetting_gap})
+    del m
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    # ── Method 2: REPLAY (20% Task A mixed into Task B) ───────────────────────
+    print("\n" + "="*60)
+    print(f"METHOD 2: REPLAY — Task B + {int(REPLAY_FRACTION*100)}% Task A")
+    print("="*60)
+    n_replay = int(len(task_b["train"]) * REPLAY_FRACTION)
+    replay_a = task_a["train"].shuffle(seed=0).select(range(n_replay))
+    replay_mix = concatenate_datasets([task_b["train"], replay_a]).shuffle(seed=0)
+    print(f"Replay mix: {len(task_b['train'])} Task B + {n_replay} Task A = {len(replay_mix)}")
+
+    m = fresh_task_a_model(None, tokenizer, task_a_adapter, device)
+    m = train(m, tokenizer, replay_mix, os.path.join(CKPT_DIR, "replay_task_b"))
+    m.save_pretrained(os.path.join(CKPT_DIR, "replay_task_b_adapter"))
+    retention_after_replay = evaluate_task_a(m, tokenizer, task_a_test, "retention_after_replay_task_b")
+    del m
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    # ── Method 3: RETAIN (placeholder — runs naive for now) ───────────────────
+    print("\n" + "="*60)
+    print("METHOD 3: RETAIN — placeholder (naive for now; estimator swaps in next)")
+    print("="*60)
+    m = fresh_task_a_model(None, tokenizer, task_a_adapter, device)
+    m = train(m, tokenizer, task_b["train"], os.path.join(CKPT_DIR, "retain_task_b"))
+    m.save_pretrained(os.path.join(CKPT_DIR, "retain_task_b_adapter"))
+    retention_after_retain = evaluate_task_a(m, tokenizer, task_a_test, "retention_after_retain_task_b")
+    del m
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
 
     # ── Final report ──────────────────────────────────────────────────────────
-    results = {
-        "retention_after_slice1":       retention_after_slice1,
-        "retention_after_slice2_naive": retention_after_slice2_naive,
-        "forgetting_gap":               forgetting_gap,
-        "acquisition_naive":            acquisition_naive,
-    }
-
     print("\n" + "="*60)
-    print("RETAIN — Naive Baseline Results")
+    print("RETAIN — O-LoRA Benchmark Results (Task A retention)")
     print("="*60)
-    print(f"  retention_after_slice1        : {retention_after_slice1:.2f}   ← baseline ceiling")
-    print(f"  retention_after_slice2_naive  : {retention_after_slice2_naive:.2f}   ← after forgetting")
-    print(f"  forgetting_gap                : {forgetting_gap:.2f}   ← the signal")
-    print(f"  acquisition_naive             : {acquisition_naive:.2f}   ← new knowledge learned")
-    print("="*60)
-    print("Forgetting is real. EWC and RETAIN will attempt to close this gap.")
+    print(f"  base_task_a_accuracy            : {base_acc:.4f}   ← zero-shot floor")
+    print(f"  retention_after_task_a          : {retention_after_task_a:.4f}   ← ceiling")
+    print(f"  retention_after_naive_task_b    : {retention_after_naive:.4f}   ← naive forgetting")
+    print(f"  forgetting_gap (naive)          : {forgetting_gap:.4f}   ← the signal")
+    print(f"  retention_after_replay_task_b   : {retention_after_replay:.4f}   ← replay")
+    print(f"  retention_after_retain_task_b   : {retention_after_retain:.4f}   ← RETAIN (placeholder)")
     print("="*60)
 
     wandb.log({
-        "summary/retention_after_slice1":       retention_after_slice1,
-        "summary/retention_after_slice2_naive": retention_after_slice2_naive,
-        "summary/forgetting_gap":               forgetting_gap,
-        "summary/acquisition_naive":            acquisition_naive,
+        "summary/base_task_a_accuracy":          base_acc,
+        "summary/retention_after_task_a":        retention_after_task_a,
+        "summary/retention_after_naive_task_b":  retention_after_naive,
+        "summary/forgetting_gap":                forgetting_gap,
+        "summary/retention_after_replay_task_b": retention_after_replay,
+        "summary/retention_after_retain_task_b": retention_after_retain,
     })
-
-    results_path = os.path.join(ROOT, "training", "naive_baseline_results.json")
-    with open(results_path, "w") as f:
-        json.dump(results, f, indent=2)
-    print(f"\nResults saved → {results_path}")
 
     wandb.finish()
 
