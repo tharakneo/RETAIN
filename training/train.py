@@ -28,13 +28,17 @@ from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"))
 from datasets import load_from_disk, concatenate_datasets
 from peft import LoraConfig, get_peft_model
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, TrainerCallback
 from trl import SFTConfig, SFTTrainer
 
 # ── Paths / constants ─────────────────────────────────────────────────────────
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(ROOT, "data")
 CKPT_DIR = os.path.join(ROOT, "training", "checkpoints")
+
+# RETAIN evolutionary importance estimator (needs ROOT on sys.path).
+sys.path.insert(0, ROOT)
+from evolution.estimator import build_retain_mask
 
 MODEL_ID = "Qwen/Qwen2.5-1.5B-Instruct"
 SYSTEM_PROMPT = "Classify the following text. Reply with only the class label."
@@ -132,8 +136,30 @@ def evaluate_task_a(model, tokenizer, dataset, label: str) -> float:
     return score
 
 
+# ── RETAIN gradient-masking callback ──────────────────────────────────────────
+class GradientMaskCallback(TrainerCallback):
+    """Zeros gradients for RETAIN-protected weights after backward() but BEFORE
+    the optimizer step, so protected (Task-A-important) weights never move during
+    Task B training. Hooking on_step_end would be too late — the optimizer would
+    already have stepped — so we use on_pre_optimizer_step."""
+
+    def __init__(self, model, mask):
+        self.model = model
+        # Pre-move each mask to the matching param's device/dtype as (1 - mask).
+        self.keep = {}
+        for name, param in model.named_parameters():
+            if name in mask:
+                self.keep[name] = (1.0 - mask[name].float()).to(param.device)
+
+    def on_pre_optimizer_step(self, args, state, control, **kwargs):
+        for name, param in self.model.named_parameters():
+            if name in self.keep and param.grad is not None:
+                param.grad.mul_(self.keep[name].to(param.grad.dtype))
+        return control
+
+
 # ── Training helpers ──────────────────────────────────────────────────────────
-def train(model, tokenizer, dataset, output_dir: str):
+def train(model, tokenizer, dataset, output_dir: str, callbacks=None):
     """Trains the given (already PEFT-wrapped) model in place on `dataset`."""
     device_type = next(model.parameters()).device.type
     trainer = SFTTrainer(
@@ -141,6 +167,7 @@ def train(model, tokenizer, dataset, output_dir: str):
         args=make_sft_config(output_dir, device_type),
         train_dataset=dataset,
         processing_class=tokenizer,
+        callbacks=callbacks,
     )
     trainer.train()
     return trainer.model
@@ -243,12 +270,35 @@ def main():
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
-    # ── Method 3: RETAIN (placeholder — runs naive for now) ───────────────────
+    # ── Method 3: RETAIN — evolutionary importance mask + gradient protection ──
     print("\n" + "="*60)
-    print("METHOD 3: RETAIN — placeholder (naive for now; estimator swaps in next)")
+    print("METHOD 3: RETAIN — protect Task-A-important LoRA weights during Task B")
     print("="*60)
+
+    # (a) Estimate the importance mask on a fresh Task-A model (gradient-free).
+    mask_model = fresh_task_a_model(None, tokenizer, task_a_adapter, device)
+    retain_mask = build_retain_mask(
+        adapter_path=task_a_adapter,
+        tokenizer=tokenizer,
+        model=mask_model,
+        task_a_test_dataset=task_a_test,
+        ag_labels=AG_LABELS,
+        n_genomes=20,
+        noise_scale=0.01,
+        threshold=0.2,
+        subset_size=100,
+        log_wandb=True,
+    )
+    del mask_model
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    # (b) Fresh Task-A adapter, then (c) train on Task B with gradient masking so
+    #     protected weights stay frozen at their Task-A values.
     m = fresh_task_a_model(None, tokenizer, task_a_adapter, device)
-    m = train(m, tokenizer, task_b["train"], os.path.join(CKPT_DIR, "retain_task_b"))
+    mask_cb = GradientMaskCallback(m, retain_mask)
+    m = train(m, tokenizer, task_b["train"], os.path.join(CKPT_DIR, "retain_task_b"),
+              callbacks=[mask_cb])
     m.save_pretrained(os.path.join(CKPT_DIR, "retain_task_b_adapter"))
     retention_after_retain = evaluate_task_a(m, tokenizer, task_a_test, "retention_after_retain_task_b")
     del m
@@ -264,7 +314,9 @@ def main():
     print(f"  retention_after_naive_task_b    : {retention_after_naive:.4f}   ← naive forgetting")
     print(f"  forgetting_gap (naive)          : {forgetting_gap:.4f}   ← the signal")
     print(f"  retention_after_replay_task_b   : {retention_after_replay:.4f}   ← replay")
-    print(f"  retention_after_retain_task_b   : {retention_after_retain:.4f}   ← RETAIN (placeholder)")
+    print(f"  retention_after_retain_task_b   : {retention_after_retain:.4f}   ← RETAIN (evolutionary mask)")
+    retain_improvement = retention_after_retain - retention_after_naive
+    print(f"  RETAIN vs naive improvement     : {retain_improvement:+.4f}   ← does protection help?")
     print("="*60)
 
     wandb.log({
@@ -274,6 +326,7 @@ def main():
         "summary/forgetting_gap":                forgetting_gap,
         "summary/retention_after_replay_task_b": retention_after_replay,
         "summary/retention_after_retain_task_b": retention_after_retain,
+        "summary/retain_vs_naive_improvement":   retain_improvement,
     })
 
     wandb.finish()
